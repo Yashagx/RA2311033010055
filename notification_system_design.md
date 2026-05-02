@@ -1,85 +1,69 @@
 # Notification System Design
 
-## Stage 1
+## Stage 1 — REST API & Real-Time
+**Auth:** `Bearer <JWT_TOKEN>` | `Content-Type: application/json`
 
-### Endpoints
-- GET /api/v1/notifications
-- GET /api/v1/notifications/:id
-- PATCH /api/v1/notifications/:id/read
-- PATCH /api/v1/notifications/read-all
-- DELETE /api/v1/notifications/:id
+| Method | Endpoint | Description |
+|:---:|---|---|
+| GET | `/notifications` | Fetch unread. Schema: `{success: bool, data: [{id, type, msg, is_read, created_at}], count}` |
+| GET | `/notifications/:id` | Fetch one. Schema: `{success: bool, data: {notif_object}}` |
+| PATCH | `/notifications/:id/read` | Mark one read. |
+| PATCH | `/notifications/read-all` | Mark all read. |
+| DELETE | `/notifications/:id` | Remove notification. |
 
-All need Authorization: Bearer token
+**WebSocket:** `ws://api.example.com/ws?token=<JWT>`
+Server maps `student_id -> socket`. On new notification, server pushes:
+```json
+{"event": "new_notification", "data": {"id": "uuid", "type": "Placement", "message": "msg", "created_at": "iso"}}
+```
 
-Real time via WebSockets - server maps studentID to socket and pushes on new notification.
-
-## Stage 2
-
-PostgreSQL - data is relational, schema is fixed.
+## Stage 2 — Database Design
+**PostgreSQL Justification:** Relational data, fixed schema, ACID transactions for `mark-all-read`, and rich indexing support.
 
 ```sql
 CREATE TYPE notification_type AS ENUM ('Placement', 'Event', 'Result');
-
-CREATE TABLE students (
-  id SERIAL PRIMARY KEY,
-  name VARCHAR(255) NOT NULL,
-  email VARCHAR(255) UNIQUE NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
+CREATE TABLE students (id SERIAL PRIMARY KEY, email VARCHAR(255) UNIQUE, created_at TIMESTAMP DEFAULT NOW());
 CREATE TABLE notifications (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
-  type notification_type NOT NULL,
-  message TEXT NOT NULL,
-  is_read BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMP DEFAULT NOW()
+  student_id INTEGER REFERENCES students(id),
+  type notification_type, message TEXT, is_read BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW()
 );
 
-SELECT id, type, message, is_read, created_at FROM notifications
-WHERE student_id = $1 AND is_read = FALSE ORDER BY created_at DESC;
-
+-- Queries: 1. Fetch Unread | 2. Mark Read | 3. Mark All Read | 4. Delete
+SELECT * FROM notifications WHERE student_id = $1 AND is_read = FALSE ORDER BY created_at DESC;
 UPDATE notifications SET is_read = TRUE WHERE id = $1 AND student_id = $2;
-
+UPDATE notifications SET is_read = TRUE WHERE student_id = $1 AND is_read = FALSE;
 DELETE FROM notifications WHERE id = $1 AND student_id = $2;
 ```
+**Scale:** At 5M rows, use **composite indexes** and **partitioning** by month on `created_at`.
 
-At 5M rows full scans slow down. Fix with composite index and monthly partitioning.
+## Stage 3 — Optimization
+**Accuracy:** `SELECT * FROM notifications WHERE student_id = $1 AND is_read = FALSE ORDER BY created_at DESC` is accurate but slow due to **Sequential Scan (O(N))**.
+**Fix:** `CREATE INDEX idx_notif ON notifications (student_id, is_read, created_at DESC);` (Jump to B-tree leaves).
+**Why not index all?** Every index slows down `INSERT/UPDATE` (write amplification) and consumes disk space.
 
-## Stage 3
-
-No index means full scan on 5M rows. SELECT * is wasteful. Indexing every column is bad - slows inserts.
-
+**7-Day Placement Query:**
 ```sql
-CREATE INDEX idx_notif ON notifications(student_id, is_read, created_at DESC);
-
-SELECT DISTINCT student_id FROM notifications
+SELECT DISTINCT student_id FROM notifications 
 WHERE type = 'Placement' AND created_at >= NOW() - INTERVAL '7 days';
 ```
 
-## Stage 4
+## Stage 4 — Caching & Delivery
+**Redis Strategy:** Key `notif:<id>:unread`, TTL 60s. Invalidate on `PATCH/DELETE`.
+**WebSocket Strategy:** Push on write if student is online.
+**Tradeoffs:** Redis reduces DB load but adds infra; WebSocket is real-time but doesn't handle offline state.
 
-Cache in Redis with 60s TTL. Invalidate on write. Long term - WebSocket push removes polling entirely.
-
-## Stage 5
-
-Original loops 50k students sequentially, no error handling, email and DB wrongly coupled. Write DB first then queue email separately - email cannot be rolled back.
-
-```
-function notify_all(student_ids, message):
-  batch_insert_to_db(student_ids, message)
-  for student_id in student_ids:
-    enqueue(email_queue, student_id, message)
-    enqueue(push_queue, student_id, message)
-
-email_worker:
-  job = dequeue(email_queue)
-  if fails: retry max 3 times with backoff
+## Stage 5 — Bulk Processing
+**Original Shortcomings:** Sequential loops (O(N) DB trips), coupled DB/Email (email can't rollback), no retries.
+**Revised Pseudocode:**
+```js
+function notify_all(ids, msg, type) {
+  batch_insert_db(ids, msg, type); // Single O(1) trip
+  ids.map(id => enqueue('email_queue', {id, msg})); // Decoupled
+}
+// Worker: retry with exponential backoff on failure.
 ```
 
-## Stage 6
-
-score = type_weight * 10^12 + timestamp_ms
-Placement=3, Result=2, Event=1
-
-Min-heap of size N gives O(log N) per insert. See notification_app_be/index.js.
+## Stage 6 — Priority & Top-N
+**Score:** `score = type_weight * 10^12 + timestamp_ms` (Placement: 3, Result: 2, Event: 1).
+**Top-N:** Maintain a **Min-Heap of size N**. Complexity: `O(log N)` per insert, `O(N)` space. Faster than `ORDER BY` on 5M rows.
